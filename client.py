@@ -1,5 +1,5 @@
 import boto3
-import os
+import os, sys, stat
 from botocore.config import Config
 from blender import bcolors
 
@@ -10,6 +10,7 @@ class Client():
 
         self.region = region
         self.colors = bcolors()
+        self.my_amis = {}
 
         if region == "us-east-1":
             self.imageId = "ami-0279c3b3186e54acd"
@@ -22,6 +23,7 @@ class Client():
         
         self.config = Config(region_name=region)
         self.client = boto3.client("ec2", config=self.config)
+        self.ec2_resource = boto3.resource("ec2")
         
     def forgeKey(self, name : str):
         print(f"{self.colors.HEADER}Heating the furnace up...{self.colors.ENDC}")
@@ -44,19 +46,19 @@ class Client():
 
         response = self.client.create_key_pair(KeyName=name)
 
-        dir = "keychain/"+name+".pem"
-        if os.path.exists(dir):
-            os.remove(dir)
+        file_path = "keychain/"+name+".pem"
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-        file = open(dir, "w")
+        file = open(file_path, "x")
         file.write(response["KeyMaterial"])
         file.close()
-
+        
+        os.chmod(file_path, stat.S_IREAD)
         print(f"{self.colors.OKCYAN}The key has been forged and is ready to be wielded!{self.colors.ENDC}")
 
     def launchInstance(self, instanceName : str, todoScript="", securityGroup="default", instanceType="t2.micro", keyName="Levis"):
         print(f"{self.colors.HEADER}Getting ready for launch...{self.colors.ENDC}")
-
         floatingIp = self.client.allocate_address()["PublicIp"]
         instanceId = self.client.run_instances(
             ImageId = self.imageId,
@@ -178,6 +180,19 @@ class Client():
                 garsson = self.client.get_waiter("instance_terminated")
                 garsson.wait(InstanceIds=[info["id"]])
                 print(f"{self.colors.FAIL}Instance {name} is no longer with us.{self.colors.ENDC}")
+    
+    def reflectImage(self, image_name, instance_id):
+        print(f"{self.colors.HEADER}Creating an image of instance: {instance_id}{self.colors.ENDC}")
+        ami = self.client.create_image(InstanceId=instance_id, Name=image_name)
+        self.my_amis[image_name] = ami["ImageId"]
+        self.ec2_resource.Image(ami["ImageId"]).wait_until_exists()
+        garsson = self.client.get_waiter("image_available")
+        garsson.wait(ImageIds=[ami["ImageId"]])
+        print(f"{self.colors.OKCYAN}Your image has been reflected!{self.colors.ENDC}")
+
+        return ami["ImageId"]
+
+
 
         
         
