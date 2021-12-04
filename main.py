@@ -19,12 +19,12 @@ clientSecond.assembleSecurityGroup("djangoGroup", "SecurityGroup for Django", [2
 djangoIp = clientSecond.launchInstance("django", todo_script=(open("django.sh", "r").read().replace("postgres_ip", postgresIp)),
                                             security_group="djangoGroup", key_name="django-g")
                                             
-djangoImageId = clientSecond.reflectImage("django_image", "django")
+clientSecond.reflectImage("django_image", "django")
 clientSecond.terminateInstance("django")
 clientSecond.assembleSecurityGroup("loadBalancerGroup", "SecurityGroup for LoadBalancer", [22,80,8080])
-clientSecond.createLoadBalancer("django-lb", "loadBalancerGroup")
-clientSecond.createAutoScaling("django-as", "django-lb", djangoImageId)
-
+clientSecond.createLoadBalancer("django-lb", "loadBalancerGroup", "django-lb-tg")
+clientSecond.assembleSecurityGroup("autoScalingGroup", "SecurityGroup for AutoScaling", [80,8080])
+clientSecond.createAutoScaling("django-as", "django-g", "autoScalingGroup", "launchConfig")
 # client = Client()
 # client.terminateThemAll()
 # client.launchInstance("teste")
