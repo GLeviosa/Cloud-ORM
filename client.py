@@ -13,7 +13,6 @@ class Client():
     def __init__(self):
         self.colors = bcolors()
         self.instances = {}
-        self.images = {}
 
         regionIsNotValid = True
         while regionIsNotValid:
@@ -37,13 +36,16 @@ class Client():
 
         self.config = Config(region_name=self.region)
         self.client = boto3.client("ec2", config=self.config)
+        self.vpcId = self.client.describe_vpcs()["Vpcs"][0]["VpcId"]
         self.loadBalancer = boto3.client("elbv2", config=self.config)
         self.autoScaling = boto3.client("autoscaling", config=self.config)
         self.ec2_resource = boto3.resource("ec2")
 
         self.subnets = []
+        self.avZones = []
         for subnet in self.client.describe_subnets()["Subnets"]:
             self.subnets.append(subnet["SubnetId"])
+            self.avZones.append(subnet["AvailabilityZone"])
         
     def forgeKey(self, name : str):
         print(f"{self.colors.HEADER}Heating the furnace up...{self.colors.ENDC}")
@@ -88,6 +90,16 @@ class Client():
             floatingIp = self.client.allocate_address()["PublicIp"]
         except ClientError as error:
             print(f"{self.colors.FAIL}Error allocating address, excluding excess...{self.colors.ENDC}")
+            addresses = self.client.describe_addresses()["Addresses"]
+            for address in addresses:
+                instanceExists = False
+                for key in address.keys():
+                        if key == "InstanceId":
+                            instanceExists = True
+                if not instanceExists:
+                    release = self.client.release_address(AllocationId=address["AllocationId"])  
+            floatingIp = self.client.allocate_address()["PublicIp"]
+            pass
         
 
         instanceId = self.client.run_instances(
@@ -116,7 +128,7 @@ class Client():
 
         print(f"{self.colors.OKGREEN}Preparing to boot it up...{self.colors.ENDC}")
 
-        garsson = self.client.get_waiter("instance_running")
+        garsson = self.client.get_waiter("instance_status_ok")
         garsson.wait(InstanceIds=[instanceId])
 
         response = self.client.associate_address(
@@ -201,8 +213,8 @@ class Client():
     
         ip = self.instances[instance_name]["ip"]
 
-    def terminateThemAll(self):
-        print(f"{self.colors.HEADER}This is gonna be a massacre...{self.colors.ENDC}")
+    def terminateAllInstances(self):
+        print(f"{self.colors.HEADER}Terminating all instances...{self.colors.ENDC}")
         filterCreator = {
             "Name" : "tag:Creator",
             "Values" : ["Giovanni"]
@@ -229,9 +241,11 @@ class Client():
 
             for name, info in instances.items():
                 print(f"{self.colors.OKBLUE}Hasta la vista {name}...{self.colors.ENDC}")
-                allocationId = self.client.describe_addresses(PublicIps=[info["ip"]])['Addresses'][0]['AllocationId']   
-                release_response = self.client.release_address(AllocationId=allocationId)
-
+                try:
+                    allocationId = self.client.describe_addresses(PublicIps=[info["ip"]])['Addresses'][0]['AllocationId']   
+                    release_response = self.client.release_address(AllocationId=allocationId)
+                except:
+                    pass
                 terminate_response = self.client.terminate_instances(InstanceIds=[info["id"]])
 
                 garsson = self.client.get_waiter("instance_terminated")
@@ -246,7 +260,9 @@ class Client():
         except:
             print(f"{self.colors.OKBLUE}There were no extra addresses...{self.colors.ENDC}")
             pass
-        
+
+    def terminateAllLoadBalancers(self):
+        print(f"{self.colors.HEADER}Terminating all loadbalancers...{self.colors.ENDC}")
         response = self.loadBalancer.describe_load_balancers()
 
         loadBalancers = response["LoadBalancers"]
@@ -260,12 +276,33 @@ class Client():
                         self.loadBalancer.delete_load_balancer(LoadBalancerArn = arn)
                         garsson = self.loadBalancer.get_waiter("load_balancers_deleted")
                         garsson.wait(LoadBalancerArns=[arn])
-                        print(f"{self.colors.FAIL}LoadBalancer {lb['LoadBalancerName']} is no longer with us.{self.colors.ENDC}")
-                
-
-        # response = self.autoScaling.describe_auto_scaling_groups
-
+                        waitBar(20)
+                        print(f"{self.colors.FAIL}LoadBalancer {lb['LoadBalancerName']} is no longer with us.{self.colors.ENDC}") 
+                        
+    def terminateAllAutoScalingGroups(self):
+        print(f"{self.colors.HEADER}Terminating all autoscaling groups...{self.colors.ENDC}")
+        response = self.autoScaling.describe_tags(Filters=[
+            {
+                "Name" : "Key",
+                "Values" : ["Creator"]
+            },
+            {
+                "Name" : "Value",
+                "Values" : ["Giovanni"]
+            }])
         
+        for tag in response["Tags"]:
+            print(f"{self.colors.OKBLUE}Hasta la vista {tag['ResourceId']}...{self.colors.ENDC}")
+            self.autoScaling.delete_auto_scaling_group(AutoScalingGroupName = tag["ResourceId"],ForceDelete = True)
+            waitBar(100)
+            print(f"{self.colors.FAIL}AutoScaling Group {tag['ResourceId']} is no longer with us.{self.colors.ENDC}") 
+
+
+    def terminateThemAll(self):
+        print(f"{self.colors.HEADER}This is gonna be a massacre...{self.colors.ENDC}")
+        self.terminateAllAutoScalingGroups()
+        self.terminateAllInstances()
+        self.terminateAllLoadBalancers()        
 
     def reflectImage(self, image_name : str, instance_name : str):
         if instance_name not in self.instances.keys():
@@ -299,7 +336,7 @@ class Client():
         print(f"{self.colors.HEADER}Creating an image of instance [{instance_name}]{self.colors.ENDC}")
         instance_id = self.instances[instance_name]["id"]
         ami = self.client.create_image(InstanceId=instance_id, Name=image_name)
-        self.images[image_name] = ami["ImageId"]
+        self.image_id = ami["ImageId"]
         garsson = self.client.get_waiter("image_available")
         garsson.wait(ImageIds=[ami["ImageId"]])
 
@@ -310,7 +347,7 @@ class Client():
 
         return ami["ImageId"]
 
-    def createLoadBalancer(self, lb_name : str, security_group_name : str):
+    def createLoadBalancer(self, lb_name : str, security_group_name : str, tg_name : str):
         print(f"{self.colors.HEADER}Getting ready to create LoadBalancer...{self.colors.ENDC}")
         try:
             response = self.loadBalancer.describe_load_balancers(
@@ -324,7 +361,7 @@ class Client():
                     except ClientError as error:
                         print(f"{self.colors.FAIL}Error while trying to delete LoadBalancer:\n{error}{self.colors.ENDC}")
                     print(f"{self.colors.FAIL}Deleting LoadBalancer [{lb_name}]...{self.colors.ENDC}")
-                    garsson = self.loadBalancer.get_waiter("load_balancer_deleted")
+                    garsson = self.loadBalancer.get_waiter("load_balancers_deleted")
                     garsson.wait(
                         LoadBalancerArn=response["LoadBalancers"][0]["LoadBalancerArn"],
                         Names=[lb_name]
@@ -342,17 +379,31 @@ class Client():
             "Name" : "group-name",
             "Values" : [security_group_name]
         }
-        
-        groupId = self.client.describe_security_groups(Filters=[filter])['SecurityGroups'][0]['GroupId']
 
+        responseTg = self.loadBalancer.create_target_group(
+            Name = tg_name,
+            Protocol = 'HTTP',
+            Port = 8080,
+            VpcId = self.vpcId,
+            HealthCheckProtocol = 'HTTP',
+            HealthCheckEnabled = True,
+            TargetType = 'instance',
+            IpAddressType = 'ipv4'
+        )
+
+        targetGroupArn = responseTg["TargetGroups"][0]["TargetGroupArn"]
+        self.tgArn = targetGroupArn
+        groupId = self.client.describe_security_groups(Filters=[filter])['SecurityGroups'][0]['GroupId']
+        
         response = self.loadBalancer.create_load_balancer(
             Name = lb_name,
             Scheme = "internet-facing",
             Type = "application",
             Subnets = self.subnets,
             SecurityGroups = [groupId],
+            IpAddressType = 'ipv4',
             Tags=[
-                    {
+                {
                     "Key" : "Creator",
                     "Value" : "Giovanni"
                 },
@@ -361,7 +412,28 @@ class Client():
                     "Value" : lb_name
                 }
             ]
-
+        )
+        loadBalancerArn = response['LoadBalancers'][0]['LoadBalancerArn']
+        responseListener = self.loadBalancer.create_listener(
+            LoadBalancerArn=loadBalancerArn,
+            Protocol='HTTP',
+            Port=80,
+            DefaultActions=[
+                {
+                    'Type': 'forward',
+                    'TargetGroupArn': targetGroupArn
+                }
+            ],
+            Tags=[
+                {
+                    "Key" : "Creator",
+                    "Value" : "Giovanni"
+                },
+                {
+                    "Key" : "Name",
+                    "Value" : lb_name
+                }
+            ]
         )
         dns = response['LoadBalancers'][0]['DNSName']
         print(f"{self.colors.OKCYAN}LoadBalacer was created:{self.colors.ENDC}")
@@ -369,10 +441,12 @@ class Client():
 
         return dns
 
-    def createAutoScaling(self, auto_scaling_name : str, load_balancer_name : str, image_id : str):
+    def createAutoScaling(self, auto_scaling_name : str, key_name : str, security_group : str, launch_config_name : str):
+        createAS = True
+        createLC = True
         try:
             response = self.autoScaling.describe_auto_scaling_groups(
-                AutoScalingGroupNames=[auto_scaling_name]
+                AutoScalingGroupNames = [auto_scaling_name]
             )
 
             if response["AutoScalingGroups"]:
@@ -384,39 +458,62 @@ class Client():
                     print(f"{self.colors.OKGREEN}AutoScaling [{auto_scaling_name}] successfully deleted!{self.colors.ENDC}")
                 else:
                     print(f"{self.colors.FAIL}AutoScaling has stopped working.{self.colors.ENDC}")
-                    return
+                    createAS = False
 
             response = self.autoScaling.describe_launch_configurations(
-                LaunchConfigurationNames = [auto_scaling_name]
+                LaunchConfigurationNames = [launch_config_name]
             )
 
             if response["LaunchConfigurations"]:
-                answer = input(f"{self.colors.WARNING}LaunchConfigurations [{auto_scaling_name}] already in use, do you wish to create a new one? (Y/n):{self.colors.ENDC} ").lower()
+                answer = input(f"{self.colors.WARNING}LaunchConfigurations [{launch_config_name}] already in use, do you wish to create a new one? (Y/n):{self.colors.ENDC} ").lower()
                 if answer in ["", "y", "yes"]:
                     response = self.autoScaling.delete_launch_configuration(
-                        AutoScalingGroupNames=auto_scaling_name
+                        LaunchConfigurationName=launch_config_name
                         )
-                    print(f"{self.colors.FAIL}Deleting AutoScaling [{auto_scaling_name}]...{self.colors.ENDC}")
+                    print(f"{self.colors.FAIL}Deleting AutoScaling [{launch_config_name}]...{self.colors.ENDC}")
                     waitBar(10)
-                    print(f"{self.colors.OKGREEN}LaunchConfigurations [{auto_scaling_name}] successfully deleted!{self.colors.ENDC}")
+                    print(f"{self.colors.OKGREEN}LaunchConfigurations [{launch_config_name}] successfully deleted!{self.colors.ENDC}")
                 else:
                     print(f"{self.colors.FAIL}LaunchConfigurations has stopped working.{self.colors.ENDC}")
-                    return
+                    createLC = False
 
         except ClientError:
             pass
 
-
-        response_lconfig = self.autoScaling.create_lauch_configurations
-        response = self.autoScaling.create_auto_scaling_group(
-            AutoScalingGroupName = auto_scaling_name,
-            LoadBalancerNames = [load_balancer_name],
-            MinSize = 1,
-            MaxSize = 3,
-            DesiredCapacity = 1,
-            InstanceId = image_id
-        )
+        
+        if createLC:
+            response_lconfig = self.autoScaling.create_launch_configuration(
+                    LaunchConfigurationName = launch_config_name,
+                    ImageId = self.image_id,
+                    KeyName = key_name,
+                    SecurityGroups = [
+                        security_group,
+                    ],
+                    InstanceType = 't2.micro',
+                )
+        if createAS:
+            response = self.autoScaling.create_auto_scaling_group(
+                AutoScalingGroupName = auto_scaling_name,
+                LaunchConfigurationName = launch_config_name,
+                MinSize = 1,
+                MaxSize = 3,
+                DesiredCapacity = 1,
+                AvailabilityZones = self.avZones,
+                TargetGroupARNs=[
+                    self.tgArn,
+                ],
+                Tags = [
+                    {
+                        "Key" : "Creator",
+                        "Value" : "Giovanni"
+                    },
+                    {
+                        "Key" : "Name",
+                        "Value" : auto_scaling_name
+                    }
+                ]
+            )
         
 def waitBar(cicles : int):
     for i in tqdm(range(cicles)):
-        time.sleep(np.random.uniform(0,1.5))
+        time.sleep(np.random.uniform(0,0.75))
